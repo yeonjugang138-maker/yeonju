@@ -19,17 +19,14 @@ from table_format import (
     configure_table_weighted, enable_drag_scroll, compute_batch_codes
 )
 
-
 # --------------------------------
 # UI 연결
-# --------------------------------
 
 form_class = uic.loadUiType("fruit_list.ui")[0]
 
 
 # --------------------------------
 # 메인 화면
-
 
 class MainList(QDialog, form_class):
 
@@ -83,7 +80,6 @@ class MainList(QDialog, form_class):
         )
 
         self.search_list_3.clicked.connect(self.go_back_to_summary)
-
         self.search_list_2.clicked.connect(self.open_registry)
 
         self.pushButton_3.setText("거래")
@@ -91,7 +87,6 @@ class MainList(QDialog, form_class):
 
         # 첫 화면: 현재 재고가 있는 과일만 표시
         QTimer.singleShot(0, self.load_list)
-
         self.pushButton_2.clicked.connect(
             self.open_setting
         )
@@ -99,19 +94,11 @@ class MainList(QDialog, form_class):
         # 창을 처음 띄운 크기에 맞춰 한 번 배치
         self._reflow()
 
-
-    # --------------------------------
-    # [추가] 창 크기가 바뀔 때마다 표/합계라벨/하단 버튼들을 다시 배치한다.
-
     def resizeEvent(self, event):
-
         super().resizeEvent(event)
-
         self._reflow()
 
-
     def _reflow(self):
-
         if not hasattr(self, "_orig_geom"):
             return
 
@@ -158,7 +145,6 @@ class MainList(QDialog, form_class):
         new_width = max(self.search_list.x() - le_og.x() - margin, 60)
         self.lineEdit.setGeometry(le_og.x(), bottom_y, new_width, le_og.height())
 
-
     # --------------------------------
     # 표에 데이터 채우는 공통 함수
 
@@ -200,11 +186,9 @@ class MainList(QDialog, form_class):
 
 
     def _fill_list_fallback(self, headers, rows):
-
         from table_format import build_table
 
         self.model.clear()
-
         header_line, row_lines = build_table(headers, rows)
 
         header_item = QStandardItem(header_line)
@@ -222,9 +206,7 @@ class MainList(QDialog, form_class):
 
     # --------------------------------
     # 과일 전체 목록 (첫 화면)
-
     def load_list(self):
-
         try:
 
             items = self.db.fetch_items_in_stock()
@@ -274,7 +256,6 @@ class MainList(QDialog, form_class):
             )
 
 
-
     def on_row_clicked(self, row, column):
 
         try:
@@ -311,7 +292,6 @@ class MainList(QDialog, form_class):
 
 
     def on_row_clicked_fallback(self, index):
-
         try:
 
             if self._mode != "summary":
@@ -345,7 +325,6 @@ class MainList(QDialog, form_class):
                 f"과일 정보를 불러오지 못했습니다.\n\n{e}"
             )
 
-
     # --------------------------------
     # 검색
 
@@ -363,7 +342,6 @@ class MainList(QDialog, form_class):
             self.load_list()
 
             return
-
 
         try:
 
@@ -422,7 +400,6 @@ class MainList(QDialog, form_class):
 
         self._fill_table(headers, rows, weights=[18, 34, 30, 18])
 
-
     # --------------------------------
     # [추가] 배치 목록(코드/과일/입고일/수량)을 표에 그리는 공통 로직.
 
@@ -469,8 +446,7 @@ class MainList(QDialog, form_class):
         # [수정] 폭 지정
         self._fill_table(headers, rows, colors=colors, weights=[18, 34, 30, 18])
 
-
-
+    
     def open_registry(self):
 
         self.lineEdit.clear()
@@ -478,7 +454,6 @@ class MainList(QDialog, form_class):
 
 
     def load_registry(self, keyword=None):
-
         try:
 
             origins = self.db.fetch_origin()   # (origin_code, origin_name)
@@ -535,21 +510,13 @@ class MainList(QDialog, form_class):
                 f"조회 목록을 불러오지 못했습니다.\n\n{e}"
             )
 
-
-    # --------------------------------
-    # 뒤로가기 (배치 상세 -> 첫 화면 요약)
-
     def go_back_to_summary(self):
 
         self.lineEdit.clear()
         self.load_list()
 
 
-    # --------------------------------
-    # [추가] 구매/판매 버튼 - 거래 선택 창을 바로 연다.
-
     def open_trade(self):
-
         try:
 
             from button_start import TradeWindow
@@ -570,7 +537,7 @@ class MainList(QDialog, form_class):
     # --------------------------------
     # 설정창 열기
 
-    # [추가] 이 창(조회 화면)이 닫히면, 여기서 파생되어 열려있던 다른 창들
+    # 조회 화면이 닫히면, 여기서 파생되어 열려있던 다른 창들
     # (설정, 거래, 구매/판매, 이력 화면 등)도 전부 같이 닫히게 한다.
     # --------------------------------
 
@@ -580,9 +547,7 @@ class MainList(QDialog, form_class):
 
         super().closeEvent(event)
 
-
     def open_setting(self):
-
         try:
 
             from button_start import Window
@@ -602,7 +567,6 @@ class MainList(QDialog, form_class):
 
 # --------------------------------
 # 프로그램 실행
-
 
 if __name__ == "__main__":
 
