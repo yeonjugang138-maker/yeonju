@@ -1,7 +1,7 @@
 // =====================================================
 // Arduino2 - ESP 8266 - Server => Serial Monitor로 확인하는 코드 
 // command 값이 WAIT 면 no task
-// command 값이 WATER 명령 받고 led 작동, completed 상태 전달
+// command 값이 WATER 명령 받고 led on, off시 completed 상태 전달
 //
 // 확인용: ESP8266이 보내는 걸 컴퓨터로 그대로 중계
 // =====================================================
