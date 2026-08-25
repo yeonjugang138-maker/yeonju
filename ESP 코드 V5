@@ -1,0 +1,488 @@
+// sendTelemetry를 통해 task id와 아두이노에서 보내는 정보(state)를 서버에 전송
+
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+
+// =====================================================
+// Wi-Fi 설정
+// =====================================================
+const char* WIFI_SSID     = "3F_302";
+const char* WIFI_PASSWORD = "0424719222!!";
+
+// =====================================================
+// 서버 설정
+// =====================================================
+const char* SERVER_HOST = "192.168.0.51";
+const int   SERVER_PORT = 8000;
+
+const char* CMD_PATH =
+  "/api/watering/command";
+
+const char* TELEMETRY_PATH =
+  "/api/watering/telemetry";
+
+// =====================================================
+// 통신 설정
+// =====================================================
+const unsigned long POLL_INTERVAL_MS = 5000;
+
+const long SERIAL_BAUD_RATE = 9600;
+
+const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
+
+const unsigned long WATERING_TIMEOUT_MS = 120000; // 2분
+
+const unsigned long WIFI_STATUS_LOG_INTERVAL_MS = 5000;
+unsigned long lastWifiStatusLogTime = 0;
+
+// =====================================================
+// 전역 변수
+// =====================================================
+unsigned long lastPollTime = 0;
+WiFiClient wifiClient;
+
+String currentTaskId = "";
+
+bool isWatering = false;
+
+unsigned long wateringStartTime = 0;
+
+// =====================================================
+// JSON에서 값 가져오기
+// =====================================================
+String extractValue(const String& json, const String& key)
+{
+  String searchKey = "\"" + key + "\"";
+
+  int idx = json.indexOf(searchKey);
+  if (idx == -1)
+  {
+    return "";
+  }
+
+  idx = json.indexOf(':', idx);
+  if (idx == -1)
+  {
+    return "";
+  }
+  idx++;
+
+  while (idx < (int)json.length())
+  {
+    char c = json.charAt(idx);
+
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+    {
+      idx++;
+    }
+    else
+    {
+      break;
+    }
+  }
+
+  if (idx >= (int)json.length())
+  {
+    return "";
+  }
+
+  if (json.charAt(idx) == '"')
+  {
+    idx++;
+
+    int end = idx;
+
+    while (end < (int)json.length())
+    {
+      if (json.charAt(end) == '"' &&
+          json.charAt(end - 1) != '\\')
+      {
+        break;
+      }
+
+      end++;
+    }
+
+    return json.substring(idx, end);
+  }
+
+  int end = idx;
+  while (end < (int)json.length())
+  {
+    char c = json.charAt(end);
+
+    if (c == ',' ||
+        c == '}' ||
+        c == ' ' ||
+        c == '\r' ||
+        c == '\n')
+    {
+      break;
+    }
+
+    end++;
+  }
+
+  return json.substring(idx, end);
+}
+
+// =====================================================
+// Wi-Fi 연결
+// =====================================================
+bool connectWiFi()
+{
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  Serial.println("# WIFI_CONNECTING");
+
+  unsigned long startTime = millis();
+
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    if (millis() - startTime > WIFI_CONNECT_TIMEOUT_MS)
+    {
+      Serial.println("# WIFI_FAILED (timeout)");
+      return false;
+    }
+
+    delay(500);
+  }
+
+  Serial.println("# WIFI_CONNECTED");
+  return true;
+}
+
+// =====================================================
+// Wi-Fi 연결 상태 확인
+// =====================================================
+void checkWiFi()
+{
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    connectWiFi();
+  }
+}
+
+// =====================================================
+// 서버 Telemetry 전송
+// =====================================================
+void sendTelemetry(
+  const String& taskId,
+  const String& state,
+  const String& errorMsg = ""
+)
+{
+  checkWiFi();
+
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    return;
+  }
+
+  HTTPClient http;
+
+  String url =
+    "http://" +
+    String(SERVER_HOST) +
+    ":" +
+    String(SERVER_PORT) +
+    String(TELEMETRY_PATH);
+
+  http.begin(wifiClient, url);
+
+  http.addHeader(
+    "Content-Type",
+    "application/json"
+  );
+
+  String body;
+
+  body = "{";
+  body += "\"task_id\":";
+  body += taskId;
+  body += ",";
+  body += "\"state\":\"";
+  body += state;
+  body += "\"";
+
+  if (errorMsg.length() > 0)
+  {
+    body += ",";
+    body += "\"error_message\":\"";
+    body += errorMsg;
+    body += "\"";
+  }
+
+  body += "}";
+
+  int httpCode = http.POST(body);
+
+  http.end();
+}
+
+// =====================================================
+// Arduino2 상태 확인
+// [수정] 아두이노는 이제 taskId 없이 "STATE:상태"만 보냄
+// ESP8266이 기억하는 currentTaskId를 그대로 사용해서 서버에 전달
+// =====================================================
+void checkArduinoStatus()
+{
+  while (Serial.available() > 0)
+  {
+    String line = Serial.readStringUntil('\n');
+
+    line.trim();
+
+    if (line.length() == 0)
+    {
+      continue;
+    }
+
+    if (!line.startsWith("STATE:"))
+    {
+      continue;
+    }
+
+    String rest = line.substring(6);   // "STATE:" 6글자 제거
+    rest.trim();
+
+    int colonIdx = rest.indexOf(':');
+
+    String state;
+    String errorMsg;
+
+    if (colonIdx == -1)
+    {
+      state = rest;
+      errorMsg = "";
+    }
+    else
+    {
+      state = rest.substring(0, colonIdx);
+      errorMsg = rest.substring(colonIdx + 1);
+
+      state.trim();
+      errorMsg.trim();
+    }
+
+    if (state != "IDLE" &&
+        state != "WATERING" &&
+        state != "COMPLETED" &&
+        state != "ERROR")
+    {
+      continue;
+    }
+
+    // 지금 진행 중이라고 기억하는 작업이 없는데 상태가 오면 무시
+    if (currentTaskId == "")
+    {
+      continue;
+    }
+
+    sendTelemetry(
+      currentTaskId,
+      state,
+      errorMsg
+    );
+
+    if (state == "COMPLETED" || state == "ERROR")
+    {
+      currentTaskId = "";
+      isWatering = false;
+    }
+  }
+}
+
+// =====================================================
+// 서버에 급수 명령 요청
+// =====================================================
+void pollCommand()
+{
+  checkWiFi();
+
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    return;
+  }
+
+  HTTPClient http;
+
+  String url =
+    "http://" +
+    String(SERVER_HOST) +
+    ":" +
+    String(SERVER_PORT) +
+    String(CMD_PATH);
+
+  http.begin(wifiClient, url);
+
+  int httpCode = http.GET();
+
+  if (httpCode <= 0)
+  {
+    Serial.print("# HTTP_REQUEST_FAILED code=");
+    Serial.println(httpCode);
+  }
+
+  if (httpCode == 200)
+  {
+    String body = http.getString();
+
+    String command =
+      extractValue(body, "command");
+
+    if (command == "WAIT")
+    {
+      Serial.println("[ESP] Server responded WAIT - no task");
+    }
+
+    else if (command == "WATER")
+    {
+      String taskId =
+        extractValue(body, "task_id");
+
+      String plantId =
+        extractValue(body, "plant_id");
+
+      String amount =
+        extractValue(body, "amount_ml");
+
+      if (taskId == "" ||
+          plantId == "" ||
+          amount == "")
+      {
+        Serial.print("# SERVER_RESPONSE_INVALID task_id=");
+        Serial.print(taskId);
+        Serial.print(" plant_id=");
+        Serial.print(plantId);
+        Serial.print(" amount_ml=");
+        Serial.println(amount);
+
+        if (taskId != "")
+        {
+          sendTelemetry(
+            taskId,
+            "ERROR",
+            "Invalid task parameters"
+          );
+        }
+
+        http.end();
+        return;
+      }
+
+      float amountValue =
+        amount.toFloat();
+
+      if (amountValue <= 0)
+      {
+        sendTelemetry(
+          taskId,
+          "ERROR",
+          "Invalid amount_ml"
+        );
+
+        http.end();
+        return;
+      }
+
+      if (isWatering)
+      {
+        http.end();
+        return;
+      }
+
+      if (currentTaskId == taskId)
+      {
+        http.end();
+        return;
+      }
+
+      currentTaskId = taskId;
+      isWatering = true;
+      wateringStartTime = millis();
+
+      // [수정 없음] 아두이노에게는 여전히 taskId를 포함해서 전달
+      // (아두이노가 무시하고 amount만 쓰더라도, 형식은 그대로 유지 가능)
+      Serial.print("WATER:");
+      Serial.print(taskId);
+      Serial.print(":");
+      Serial.print(plantId);
+      Serial.print(":");
+      Serial.println(amount);
+    }
+
+    else
+    {
+      Serial.print("# UNKNOWN_COMMAND: ");
+      Serial.println(command);
+    }
+  }
+
+  else
+  {
+    Serial.print("# HTTP_ERROR code=");
+    Serial.println(httpCode);
+  }
+
+  http.end();
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+void setup()
+{
+  Serial.begin(SERIAL_BAUD_RATE);
+  delay(1000);
+
+  connectWiFi();
+
+  lastPollTime = millis();
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+void loop()
+{
+  unsigned long now = millis();
+
+  checkArduinoStatus();
+
+  if (isWatering &&
+      (now - wateringStartTime >= WATERING_TIMEOUT_MS))
+  {
+    sendTelemetry(
+      currentTaskId,
+      "ERROR",
+      "Watering timeout - no response from Arduino2"
+    );
+
+    Serial.print("STOP:");
+    Serial.println(currentTaskId);
+
+    currentTaskId = "";
+    isWatering = false;
+  }
+
+  if (now - lastWifiStatusLogTime >= WIFI_STATUS_LOG_INTERVAL_MS)
+  {
+    lastWifiStatusLogTime = now;
+
+    if (WiFi.status() != WL_CONNECTED)
+    {
+      Serial.println("# WIFI_DISCONNECTED");
+    }
+  }
+
+  if (now - lastPollTime >= POLL_INTERVAL_MS)
+  {
+    lastPollTime = now;
+
+    pollCommand();
+  }
+
+  yield();
+}
