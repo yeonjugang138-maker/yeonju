@@ -1,0 +1,141 @@
+// =====================================================
+// Arduino2 - ESP8266 - Server 연동용 (워터펌프, TB6612FNG)
+// 수신 형식: WATER:task_id:plant_id:amount_ml
+// 송신 형식: STATE:task_id:상태
+// =====================================================
+
+#include <SoftwareSerial.h>
+
+SoftwareSerial espSerial(2, 3);  // (RX, TX) 
+
+const int PIN_STBY = 11;
+const int PIN_AIN1 = 7;
+const int PIN_AIN2 = 4;
+const int PIN_PWMA = 9;
+const int PIN_LED = 13;
+
+const int PUMP_SPEED = 100;   
+
+// MS_PER_ML = 펌프를 돌린 시간(ms) ÷ 그 시간 동안 나온 물의 양(ml)
+float MS_PER_ML = 40.0;   
+
+unsigned long endTime = 0;  // 목표 시각을 저장하는 변수
+bool isOn = false;     // 펌프가 동작중인지 확인, 동작중이면 true => 새 명령 거부
+String currentTaskId = "";   // 지금 처리 중인 작업의 task_id
+
+// WiFi 연결 상태 및 깜빡임 관리용 변수
+bool wifiConnected = false;
+unsigned long lastBlinkTime = 0;
+bool blinkState = false;
+const unsigned long BLINK_INTERVAL_MS = 500; 
+
+void startPump() {
+  digitalWrite(PIN_LED, HIGH);
+  digitalWrite(PIN_STBY, HIGH);
+  digitalWrite(PIN_AIN1, HIGH);  // AIN1=HIGH, AIN2=LOW 조합 = 정방향 회전, AIN1=LOW, AIN2=HIGH면 역방향
+  digitalWrite(PIN_AIN2, LOW);
+  analogWrite(PIN_PWMA, PUMP_SPEED);
+}
+
+void stopPump() {
+  digitalWrite(PIN_STBY, LOW);
+  analogWrite(PIN_PWMA, 0);
+  digitalWrite(PIN_LED, LOW);
+}
+
+void setup() {
+  pinMode(PIN_STBY, OUTPUT);
+  pinMode(PIN_AIN1, OUTPUT);
+  pinMode(PIN_AIN2, OUTPUT);
+  pinMode(PIN_PWMA, OUTPUT);
+  pinMode(PIN_LED, OUTPUT);
+  stopPump(); // 아두이노가 켜졌을때 펌프가 동작하지 않게 하기 위함 
+
+  Serial.begin(9600);
+  espSerial.begin(9600);
+
+}
+
+void loop() {
+  // -----------------------------------------------
+  // ESP8266으로부터 새 메시지 확인
+  // -----------------------------------------------
+  if (espSerial.available()) {
+    String cmd = espSerial.readStringUntil('\n');
+    cmd.trim();
+
+    // -----------------------------------------------
+    // 급수 명령: WATER:task_id:plant_id:amount_ml
+    // -----------------------------------------------
+    if (cmd.startsWith("WATER:")) {
+      if (!isOn) {
+        String rest = cmd.substring(6);        // "task_id:plant_id:amount_ml" = "WATER:9:1:80.0" → "9:1:80.0"
+
+        int c1 = rest.indexOf(':');            // task_id 끝 위치 "9:1:80.0"에서 첫 콜론 위치를 찾고, 그 앞부분만 잘라냄 
+        String taskId = rest.substring(0, c1); // → taskId = "9"
+
+        String afterTaskId = rest.substring(c1 + 1); // "plant_id:amount_ml" "1:80.0"
+        int c2 = afterTaskId.indexOf(':');            // plant_id 끝 위치 "1:80.0"에서 두 번째 콜론(plantId 끝) 위치 찾기
+
+        float amount = afterTaskId.substring(c2 + 1).toFloat(); // 그 콜론 다음부터 끝까지 잘라서 숫자로 변환 → amount = 80.0
+
+        currentTaskId = taskId;  // 상태 저장
+
+        startPump();  // 펌프 시작
+        isOn = true;  // isOn이 true로 변함
+        endTime = millis() + (unsigned long)(amount * MS_PER_ML);   // 목표 시각을 계산해서 저장
+
+        // taskId를 포함해서 ESP8266에 상태 전달    STATE:9:WATERING
+        espSerial.print("STATE:");
+        espSerial.print(taskId);
+        espSerial.println(":WATERING");
+
+        Serial.print("STATE:");   // 시리얼 모니터 확인 용
+        Serial.print(taskId);
+        Serial.println(":WATERING");
+      }
+    }
+    // -----------------------------------------------
+    // '#'으로 시작하는 ESP8266 상태 로그 (WiFi 연결 등)
+    // -----------------------------------------------
+    else if (cmd.startsWith("#")) {
+      Serial.println(cmd);
+
+      // WiFi 연결 상태 감지
+      if (cmd.indexOf("WIFI_CONNECTED") != -1) {
+        wifiConnected = true;
+      } else if (cmd.indexOf("WIFI_DISCONNECTED") != -1 ||
+                 cmd.indexOf("WIFI_FAILED") != -1) {
+        wifiConnected = false;
+        digitalWrite(PIN_LED, LOW);   
+      }
+    }
+    // 그 외(WAIT 등)는 무시
+  }
+  // -----------------------------------------------
+  // 목표 시간 도달 시 급수 종료
+  // -----------------------------------------------
+  if (isOn && millis() >= endTime) {
+    stopPump();
+    isOn = false;
+
+    espSerial.print("STATE:");
+    espSerial.print(currentTaskId);
+    espSerial.println(":COMPLETED");
+
+    Serial.print("STATE:");
+    Serial.print(currentTaskId);
+    Serial.println(":COMPLETED");
+  }
+
+  // -----------------------------------------------
+  // WiFi 연결된 동안 계속 깜빡이기
+  // -----------------------------------------------
+  if (wifiConnected) {
+    if (millis() - lastBlinkTime >= BLINK_INTERVAL_MS) {
+      lastBlinkTime = millis();
+      blinkState = !blinkState;
+      digitalWrite(PIN_LED, blinkState ? HIGH : LOW);
+    }
+  }
+}
