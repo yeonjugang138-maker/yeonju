@@ -1,0 +1,236 @@
+import numpy as np
+import cv2
+from collections import deque
+
+COLORS = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (0, 255, 255)]
+COLOR_NAMES = ["BLUE", "GREEN", "RED", "YELLOW"]
+colorIndex = 0
+
+# 색상별 궤적. 각 색은 deque들의 리스트(구간별로 끊어 그리기 위함)
+strokes = [[deque(maxlen=512)] for _ in COLORS]
+
+kernel = np.ones((5, 5), np.uint8)
+
+LOWER = np.array([0, 0, 0])
+UPPER = np.array([0, 0, 0])
+MIN_AREA = 150       # 이보다 작으면 잡음으로 무시
+MAX_AREA_RATIO = 0.05  # 화면의 이 비율보다 크면 배경으로 보고 무시
+ROI_RADIUS = 100      # 직전 위치 기준 이 반경 -> 2배 반경까지만 찾음 (화면 전체로 튀는 것 방지)
+SMOOTH_ALPHA = 0.6     # 떨림/튐 완충용 지수이동평균 (0=반응빠름/떨림, 1=부드러움/느림)
+
+calib_box = (310, 220, 330, 240)
+calibrated = False
+paused = False
+search_center = None
+smoothed_center = None
+calibrated_bgr = None  # 보정된 순간의 펜 색 (패널에 미리보기로 표시)
+
+KEY_HELP = [
+    "S   calibrate pen color",
+    "R   reset calibration",
+    "P   change draw color",
+    "C   clear canvas",
+    "Space  pause / resume",
+    "Q   quit",
+]
+
+
+def break_stroke():
+    for s in strokes:
+        s.append(deque(maxlen=512))
+
+
+def clear_canvas():
+    global strokes
+    strokes = [[deque(maxlen=512)] for _ in COLORS]
+    paintWindow[:, :, :] = 255
+
+
+def draw_pencil(img, tip, angle_deg=-40, length=36, width=9):
+    """인식된 위치(tip)에 연필 모양 아이콘을 그림 (연필심이 정확히 tip에 오도록)"""
+    a = np.deg2rad(angle_deg)
+    cos_a, sin_a = np.cos(a), np.sin(a)
+
+    def rot(x, y):
+        rx, ry = x * cos_a - y * sin_a, x * sin_a + y * cos_a
+        return (int(tip[0] + rx), int(tip[1] + ry))
+
+    tip_h, body_h, eraser_h = length * 0.18, length * 0.7, length * 0.12
+    w2 = width / 2
+
+    tip_pts = np.array([rot(0, 0), rot(-w2, tip_h), rot(w2, tip_h)], dtype=np.int32)
+    body_pts = np.array([rot(-w2, tip_h), rot(w2, tip_h),
+                          rot(w2, tip_h + body_h), rot(-w2, tip_h + body_h)], dtype=np.int32)
+    eraser_pts = np.array([rot(-w2, tip_h + body_h), rot(w2, tip_h + body_h),
+                            rot(w2, tip_h + body_h + eraser_h), rot(-w2, tip_h + body_h + eraser_h)], dtype=np.int32)
+
+    cv2.fillPoly(img, [body_pts], (0, 200, 255))       # 노란 몸통
+    cv2.fillPoly(img, [tip_pts], (20, 20, 20))         # 연필심(검정)
+    cv2.fillPoly(img, [eraser_pts], (180, 105, 255))   # 지우개(분홍)
+    cv2.polylines(img, [body_pts], True, (0, 0, 0), 1)
+    cv2.polylines(img, [tip_pts], True, (0, 0, 0), 1)
+    cv2.polylines(img, [eraser_pts], True, (0, 0, 0), 1)
+
+
+def find_pen(hsv_region, min_area, max_area, ref):
+    """LOWER~UPPER 범위에서 조명/피부색을 제외하고, ref와 가장 가까운 덩어리를 반환"""
+    mask = cv2.inRange(hsv_region, LOWER, UPPER)
+    glare = cv2.inRange(hsv_region, (0, 0, 235), (179, 40, 255))     # 하얗게 날아간 조명
+    skin = cv2.inRange(hsv_region, (0, 30, 60), (20, 150, 255))      # 손/피부색
+    mask = cv2.bitwise_and(mask, cv2.bitwise_not(glare))
+    mask = cv2.bitwise_and(mask, cv2.bitwise_not(skin))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.dilate(mask, kernel, iterations=1)
+
+    cnts, _ = cv2.findContours(mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cnts = [c for c in cnts if min_area < cv2.contourArea(c) < max_area]
+    if not cnts:
+        return None
+
+    def dist_to_ref(c):
+        M = cv2.moments(c)
+        return (M['m10'] / M['m00'] - ref[0]) ** 2 + (M['m01'] / M['m00'] - ref[1]) ** 2
+
+    cnt = min(cnts, key=dist_to_ref)  # 가장 큰 게 아니라 직전 위치에 가장 가까운 것
+    M = cv2.moments(cnt)
+    return (int(M['m10'] / M['m00']), int(M['m01'] / M['m00']))
+
+
+def draw_panel(mode_text):
+    """조작키 안내 + 현재 그리는 색 / 보정된 펜 색 미리보기를 보여주는 설정 패널"""
+    panel = np.full((360, 320, 3), 245, dtype=np.uint8)
+    cv2.putText(panel, "Controls", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2, cv2.LINE_AA)
+
+    y = 60
+    for line in KEY_HELP:
+        cv2.putText(panel, line, (15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 60, 60), 1, cv2.LINE_AA)
+        y += 25
+
+    y += 10
+    cv2.putText(panel, f"Mode: {mode_text}", (15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+    y += 35
+
+    cv2.putText(panel, "Draw color:", (15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+    cv2.rectangle(panel, (150, y - 15), (185, y + 5), COLORS[colorIndex], -1)
+    cv2.rectangle(panel, (150, y - 15), (185, y + 5), (0, 0, 0), 1)
+    cv2.putText(panel, COLOR_NAMES[colorIndex], (195, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+    y += 35
+
+    cv2.putText(panel, "Calibrated pen color:", (15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+    y += 10
+    if calibrated_bgr is not None:
+        cv2.rectangle(panel, (15, y), (60, y + 30), calibrated_bgr, -1)
+        cv2.rectangle(panel, (15, y), (60, y + 30), (0, 0, 0), 1)
+    else:
+        cv2.rectangle(panel, (15, y), (60, y + 30), (200, 200, 200), -1)
+        cv2.putText(panel, "-", (32, y + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (120, 120, 120), 1, cv2.LINE_AA)
+    return panel
+
+
+paintWindow = np.zeros((471, 636, 3)) + 255
+cv2.namedWindow('Paint', cv2.WINDOW_AUTOSIZE)
+cap = cv2.VideoCapture(0)
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    frame = cv2.flip(frame, 1)
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    h, w = frame.shape[:2]
+
+    # 보정용 박스 + 실시간 색 미리보기 (박스를 펜 색으로 꽉 채우고 S를 눌러야 정확함)
+    bx1, by1, bx2, by2 = calib_box
+    cv2.rectangle(frame, (bx1, by1), (bx2, by2), (0, 0, 0), 2)
+    cv2.putText(frame, "S: calibrate", (bx1 - 10, by1 - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2, cv2.LINE_AA)
+    preview = frame[by1:by2, bx1:bx2].reshape(-1, 3).mean(axis=0).astype(np.uint8).tolist()
+    cv2.rectangle(frame, (bx1, by2 + 10), (bx1 + 40, by2 + 40), preview, -1)
+    cv2.rectangle(frame, (bx1, by2 + 10), (bx1 + 40, by2 + 40), (0, 0, 0), 1)
+
+    center = None
+    if calibrated:
+        if search_center is None:
+            search_center = ((bx1 + bx2) // 2, (by1 + by2) // 2)
+
+        max_area = h * w * MAX_AREA_RATIO
+        for radius in (ROI_RADIUS, ROI_RADIUS * 2):
+            rx1, ry1 = max(search_center[0] - radius, 0), max(search_center[1] - radius, 0)
+            rx2, ry2 = min(search_center[0] + radius, w), min(search_center[1] + radius, h)
+            ref = (search_center[0] - rx1, search_center[1] - ry1)
+            found = find_pen(hsv[ry1:ry2, rx1:rx2], MIN_AREA, min(max_area, (rx2 - rx1) * (ry2 - ry1)), ref)
+            if found is not None:
+                center = (found[0] + rx1, found[1] + ry1)
+                break
+        cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), (255, 255, 0), 1)
+
+        # 진단용: 지금 뭐가 인식되는지 화면 전체 마스크로 표시 (흰색 = 인식 대상)
+        debug_mask = cv2.inRange(hsv, LOWER, UPPER)
+        debug_mask &= cv2.bitwise_not(cv2.inRange(hsv, (0, 0, 235), (179, 40, 255)))
+        debug_mask &= cv2.bitwise_not(cv2.inRange(hsv, (0, 30, 60), (20, 150, 255)))
+        cv2.imshow("Mask (white = recognized as pen)", debug_mask)
+
+        if center is not None:
+            search_center = center
+            smoothed_center = center if smoothed_center is None else (
+                int(SMOOTH_ALPHA * smoothed_center[0] + (1 - SMOOTH_ALPHA) * center[0]),
+                int(SMOOTH_ALPHA * smoothed_center[1] + (1 - SMOOTH_ALPHA) * center[1]),
+            )
+            center = smoothed_center
+            draw_pencil(frame, center)
+        else:
+            smoothed_center = None
+
+    if calibrated and not paused:
+        if center is not None:
+            strokes[colorIndex][-1].appendleft(center)
+        else:
+            break_stroke()  # 놓치면 선이 이어지지 않게 구간을 끊음
+
+    # 궤적 그리기
+    for i, s in enumerate(strokes):
+        for seg in s:
+            for k in range(1, len(seg)):
+                if seg[k - 1] is None or seg[k] is None:
+                    continue
+                cv2.line(frame, seg[k - 1], seg[k], COLORS[i], 2)
+                cv2.line(paintWindow, seg[k - 1], seg[k], COLORS[i], 2)
+
+    if not calibrated:
+        mode_text = "waiting"
+    elif paused:
+        mode_text = "PAUSED"
+    else:
+        mode_text = "drawing"
+
+    cv2.imshow("Tracking", frame)
+    cv2.imshow("Paint", paintWindow)
+    cv2.imshow("Controls", draw_panel(mode_text))
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('c'):
+        clear_canvas()
+    elif key == ord('p'):
+        colorIndex = (colorIndex + 1) % len(COLORS)
+    elif key == ord('s'):
+        # 박스 안 색을 샘플링해서 그 주변 범위만 인식하도록 보정 (재보정도 동일)
+        roi = hsv[by1:by2, bx1:bx2]
+        h_med, s_med, v_med = [int(np.median(roi[:, :, i])) for i in range(3)]
+        LOWER = np.array([max(h_med - 8, 0), max(s_med - 30, 0), max(v_med - 30, 0)])
+        UPPER = np.array([min(h_med + 8, 179), min(s_med + 30, 255), min(v_med + 30, 255)])
+        calibrated = True
+        calibrated_bgr = preview  # 이 순간 박스 미리보기 색을 패널에 고정 표시
+        search_center = smoothed_center = None
+        print(f"[calibrate] HSV median=({h_med},{s_med},{v_med}) range={LOWER.tolist()}~{UPPER.tolist()}")
+    elif key == ord('r'):
+        calibrated = paused = False
+        search_center = smoothed_center = None
+        calibrated_bgr = None
+    elif key == ord(' '):
+        paused = not paused
+        break_stroke()
+    elif key == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
