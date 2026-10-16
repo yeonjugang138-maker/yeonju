@@ -1,0 +1,21 @@
+# Python 캐시
+__pycache__/
+*.pyc
+
+# colcon 빌드 결과물 (각자 빌드해서 생성)
+build/
+install/
+log/
+
+# YOLO 가중치 / 학습 결과 (용량이 커서 제외)
+*.pt
+runs/
+
+# 녹화 영상, 압축 파일
+*.mp4
+*.zip
+
+# 에디터 / OS 설정
+.vscode/
+.idea/
+.DS_Store
